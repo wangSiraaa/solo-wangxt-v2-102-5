@@ -5,6 +5,10 @@
 极化复用由输入规则决定（禁止 / 允许 / 隔离度未知待评估）；并可用 **OR-Tools CP-SAT**
 为载波寻找一组满足间隔的频率位置。
 
+课堂实验可离线导入 **频谱扫频记录（测量批次）** 校验简化掩模：原始测量不会覆盖设计掩模，
+坏文件也不会污染场景；分析页可叠加 **理论 / 实测（校准后）/ 保守包络**，
+并可选择让规划器以经确认的测量包络做 post-check。
+
 > ⚠️ 纯离线简化模型：**不连接无线电设备，不生成任何发射指令**。掩模与发射谱均为教学
 > 用平顶 + 折线衰减的简化数值，不对应任何标准或真实设备指标。
 
@@ -16,19 +20,21 @@
 | 后端 | FastAPI + Pydantic + SQLAlchemy 2 |
 | 科学计算 | SciPy（掩模分段线性插值、PSD 积分）、NumPy |
 | 约束求解 | OR-Tools CP-SAT（1 kHz 频率网格） |
-| 数据库 | PostgreSQL（中心频率、带宽、功率、示例掩模、场景） |
+| 数据库 | PostgreSQL（中心频率、带宽、功率、示例掩模、场景、校准版本、测量批次、计划记录） |
 
 ## 目录
 
 ```
 backend/   FastAPI 应用
-  app/services/units.py     dBm<->W、线性域功率汇总
-  app/services/masks.py     掩模折线、发射谱曲线（SciPy interp1d）
-  app/services/analysis.py  三类冲突检查（定位到载波对/方向）
-  app/services/planner.py   OR-Tools CP-SAT 频率规划
-  app/db.py / seed.py       SQLAlchemy 模型与教学演示场景
+  app/services/units.py        dBm<->W、线性域功率汇总
+  app/services/masks.py        掩模折线、发射谱曲线（SciPy interp1d）
+  app/services/analysis.py     三类冲突检查（定位到载波对/方向），支持实测包络口径
+  app/services/planner.py      OR-Tools CP-SAT 频率规划
+  app/services/sweepfile.py    离线扫频文件解析（JSON/CSV，完整校验）
+  app/services/measurement.py  校准曲线、保守包络、理论偏差计算
+  app/db.py / seed.py          SQLAlchemy 模型与教学演示场景
 frontend/  React + Plotly.js
-scripts/   start-dev.sh     一键启动（本地 PostgreSQL + 后端 + 前端）
+scripts/   start-dev.sh        一键启动（本地 PostgreSQL + 后端 + 前端）
 ```
 
 ## 快速开始
@@ -87,6 +93,42 @@ CP-SAT 在 1 kHz 网格上为每个载波选中心频率，约束：
 - 目标：最小化相对录入位置的总偏移。无解时返回 `INFEASIBLE` 与放宽建议。
   返回中带 `post_check`（对方案重新跑一遍完整分析）。
 
+### 4. 测量批次（离线扫频导入）
+
+- **导入**（`POST /api/scenarios/{id}/measurements/import`）：文件带批次标识、采样时刻、
+  频率/功率点与校准版本引用（JSON 或 CSV，按内容自动识别）。**原子化**：先完整解析校验，
+  再单事务写入——格式错误、坏行、非单调频率、缺失校准都整体拒绝，不写入半个批次。
+- **持久化**：原始记录、校准后曲线、与当前理论掩模的偏差、保守包络
+  （逐点 `max(理论, 校准后实测)`，掩模跨度外取实测）全部随批次保存。
+- **幂等与乱序**：相同批次（规范化内容 SHA-256 相同）重放幂等；同批次键不同内容拒绝覆盖；
+  每个载波以采样时刻最新者为**已确认**结论，迟到的旧测量归档为 `superseded`，
+  不产生重复点也不覆盖更新的结论。
+- **校准版本**（`POST/GET /api/calibrations`）：同名注册自动递增版本号，旧版本不可变；
+  历史批次仍按其导入时的校准版本复现。校准修订会让依赖它的已确认测量所属场景的
+  活动计划过期（需按新基准重评估）。
+- **计划记录**：关联场景的规划持久化为计划记录（含 post_check 历史结果，永不篡改）；
+  实测越限的批次被确认时，关联活动计划置为 `expired` 并记录原因，历史结果保持原样。
+- **测量包络 post-check**：`POST /api/plan` 传 `post_check_basis="measurement_envelope"`
+  （需 `scenario_id`），掩模尾部泄漏按 `max(理论掩模, 已确认实测)` 的保守包络复核。
+- **导出/导入**（`GET /api/scenarios/{id}/export`、`POST /api/scenarios/import`）：
+  场景连同校准、测量批次、计划记录整体迁移，批次与计划状态保持一致；
+  校准按 `(名称, 版本)` 对齐，修正量不一致时拒绝覆盖。
+
+扫频文件示例（CSV；`#` 行为元数据头）：
+
+```csv
+# batch_key: SWEEP-2026-09-30-001
+# carrier: C1
+# sampled_at: 2026-09-30T14:22:00Z
+# calibration: CAL-LAB-A@1
+freq_mhz,power_dbm_hz
+98.0,-56.2
+98.5,-55.8
+```
+
+JSON 等价：`{"batch_key": ..., "carrier_name": ..., "sampled_at": ...,
+"calibration": {"name": ..., "version": 1}, "points": [{"freq_mhz": ..., "power_dbm_hz": ...}, ...]}`。
+
 ## 教学演示场景（种子数据，12 个载波，带宽均为 4 MHz、功率不同）
 
 | 载波对 | 现象 |
@@ -105,5 +147,7 @@ CP-SAT 在 1 kHz 网格上为每个载波选中心频率，约束：
 PYTHONPATH=backend pytest backend/tests -q
 ```
 
-19 个测试覆盖：dBm/W 换算、三类冲突对定位、泄漏方向性、三种极化规则、
-两种规划模式的可行性与规划后零越界、场景 CRUD 等。
+46 个测试覆盖：dBm/W 换算、三类冲突对定位、泄漏方向性、三种极化规则、
+两种规划模式的可行性与规划后零越界、场景 CRUD，以及测量批次验收：
+有效导入的理论/实测偏差与保守包络复核、坏文件整体拒绝、幂等重放与乱序归档、
+校准修订可追溯与计划过期、导出/导入状态一致。

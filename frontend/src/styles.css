@@ -145,5 +145,29 @@ label.field-label { color: var(--muted); font-size: 12px; }
 .status-pill.attention { background: rgba(245,166,35,.15); color: var(--warning); }
 
 .err-msg { color: var(--error); font-size: 12px; margin-top: 6px; }
+.ok-msg { color: var(--ok); font-size: 12px; margin-top: 6px; }
 .muted { color: var(--muted); }
 .plot-note { font-size: 11px; color: var(--muted); margin: 2px 0 8px; }
+
+/* 测量批次列表 */
+.batch-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 220px; overflow-y: auto; }
+.batch-list li {
+  padding: 6px 8px; border-radius: 5px; margin-bottom: 5px;
+  background: var(--panel-2); border-left: 3px solid var(--muted);
+  cursor: pointer; font-size: 12px;
+}
+.batch-list li.confirmed { border-left-color: var(--ok); }
+.batch-list li.superseded { border-left-color: var(--muted); opacity: 0.75; }
+.batch-list li.sel { outline: 1.5px solid var(--accent); }
+.batch-list .muted { font-size: 11px; }
+
+.tag {
+  font-size: 10px; padding: 0 6px; border-radius: 8px;
+  border: 1px solid currentColor; white-space: nowrap;
+}
+.tag.confirmed { color: var(--ok); }
+.tag.superseded { color: var(--muted); }
+.tag.violation { color: var(--error); }
+.tag.cal { color: var(--accent); margin: 2px 4px 2px 0; display: inline-block; }
+
+.cal-list { margin-top: 6px; }

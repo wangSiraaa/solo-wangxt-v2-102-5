@@ -22,7 +22,7 @@ from typing import Literal, Optional
 
 import numpy as np
 
-from .masks import get_mask, spectrum_curve
+from .masks import get_mask, psd_on_grid, spectrum_curve
 from .units import dbm_to_watt, total_power_watt, watt_to_dbm
 
 Polarization = Literal["H", "V", "LHCP", "RHCP"]
@@ -73,16 +73,28 @@ def edge_gap_mhz(a: Carrier, b: Carrier) -> float:
 
 
 def leakage_power_dbm(tx: Carrier, victim: Carrier,
-                      grid_step_mhz: float = 0.01) -> float:
+                      grid_step_mhz: float = 0.01,
+                      envelope=None) -> float:
     """tx 载波的掩模发射谱落入 victim 频带内的总功率 (dBm)。
 
     PSD 在线性域 (W/Hz) 上对频率积分：
         P_leak = ∫_victim_band 10**(psd_dbm_hz/10) * 1e-3 df
     df 以 Hz 计。超出掩模跨度的网格点 psd = -inf，贡献为 0。
+
+    若提供 envelope（经确认的实测包络，EnvelopeCurve），发射谱取
+    max(理论掩模, 校准后实测) 的保守包络，频率网格相应扩展到实测范围。
     """
     mask = get_mask(tx.mask_name)
-    f, psd = spectrum_curve(mask, tx.center_mhz, tx.bandwidth_mhz,
-                            tx.power_dbm, grid_step_mhz)
+    if envelope is None:
+        f, psd = spectrum_curve(mask, tx.center_mhz, tx.bandwidth_mhz,
+                                tx.power_dbm, grid_step_mhz)
+    else:
+        span = mask.span_mhz
+        f_lo = min(tx.center_mhz - span, envelope.f_mhz[0])
+        f_hi = max(tx.center_mhz + span, envelope.f_mhz[-1])
+        f = np.arange(f_lo, f_hi + grid_step_mhz / 2, grid_step_mhz)
+        theory = psd_on_grid(mask, f, tx.center_mhz, tx.bandwidth_mhz, tx.power_dbm)
+        psd = np.maximum(theory, envelope.measured_on(f))
     inside = (f >= victim.low - 1e-12) & (f <= victim.high + 1e-12)
     if not np.any(inside):
         return float("-inf")
@@ -105,9 +117,15 @@ def _finding(ftype: str, severity: str, a: Carrier, b: Carrier,
     return out
 
 
-def analyze(carriers: list[Carrier], rules: AnalysisRules) -> dict:
-    """对整组载波做冲突检查与功率汇总。"""
+def analyze(carriers: list[Carrier], rules: AnalysisRules,
+            envelopes: Optional[dict] = None) -> dict:
+    """对整组载波做冲突检查与功率汇总。
+
+    envelopes：可选的 {载波名: EnvelopeCurve}，提供时掩模尾部泄漏按
+    max(理论掩模, 校准后实测) 的保守包络评估（规划 post-check 的测量基准）。
+    """
     findings: list[dict] = []
+    envelopes = envelopes or {}
 
     for a, b in itertools.combinations(carriers, 2):
         # 边缘净距：频带不相交时 >0（净空），相切时 0，重叠时 <0
@@ -160,12 +178,13 @@ def analyze(carriers: list[Carrier], rules: AnalysisRules) -> dict:
         skip_tail = (policy == "allowed") or geometrically_overlap
         if not skip_tail:
             for tx, victim in ((a, b), (b, a)):
-                leak = leakage_power_dbm(tx, victim)
+                leak = leakage_power_dbm(tx, victim, envelope=envelopes.get(tx.name))
                 if leak > rules.leakage_limit_dbm:
                     findings.append(_finding(
                         "mask_tail", "error", tx, victim,
                         f"{tx.name} 的掩模尾部泄漏到 {victim.name} 频带内 "
-                        f"{leak:.1f} dBm，超过限值 {rules.leakage_limit_dbm:.1f} dBm",
+                        f"{leak:.1f} dBm，超过限值 {rules.leakage_limit_dbm:.1f} dBm"
+                        + ("（按实测保守包络）" if tx.name in envelopes else ""),
                         leakage_dbm=round(leak, 2),
                         limit_dbm=rules.leakage_limit_dbm,
                         excess_dbm=round(leak - rules.leakage_limit_dbm, 2),
@@ -196,5 +215,7 @@ def analyze(carriers: list[Carrier], rules: AnalysisRules) -> dict:
         "findings": findings,
         "power_summary": summary,
         "counts": counts,
+        # 评估基准：理论掩模 / 经确认的实测保守包络
+        "basis": "measurement_envelope" if envelopes else "theory",
         "status": "conflict" if counts["error"] else ("attention" if (counts["warning"] or counts["pending"]) else "ok"),
     }

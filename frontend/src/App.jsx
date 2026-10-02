@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api.js'
 import CarrierTable from './components/CarrierTable.jsx'
 import RulesPanel, { policyKey } from './components/RulesPanel.jsx'
@@ -7,6 +7,8 @@ import PowerSummary from './components/PowerSummary.jsx'
 import BandChart from './components/BandChart.jsx'
 import SpectrumChart from './components/SpectrumChart.jsx'
 import MaskPreview from './components/MaskPreview.jsx'
+import MeasurementPanel from './components/MeasurementPanel.jsx'
+import CalibrationPanel from './components/CalibrationPanel.jsx'
 
 const EMPTY_RULES = { guard_required_mhz: 1.0, leakage_limit_dbm: -45.0, reuse_policy: {} }
 
@@ -26,19 +28,37 @@ export default function App() {
   const [analysis, setAnalysis] = useState(null)
   const [plan, setPlan] = useState(null)
   const [planMode, setPlanMode] = useState('guard_only')
+  const [planBasis, setPlanBasis] = useState('theory')
+  const [planRecords, setPlanRecords] = useState([])
   const [planView, setPlanView] = useState(false)
   const [tab, setTab] = useState('spectrum')
   const [selectedPair, setSelectedPair] = useState(null)
+  const [calibrations, setCalibrations] = useState([])
+  const [batches, setBatches] = useState([])
+  const [selectedBatchId, setSelectedBatchId] = useState(null)
+  const [batchDetail, setBatchDetail] = useState(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  const importRef = useRef(null)
 
   useEffect(() => {
     api.masks().then(setMasks).catch((e) => setError(String(e)))
     refreshScenarios()
+    refreshCalibrations()
   }, [])
 
   const refreshScenarios = () =>
     api.listScenarios().then(setScenarios).catch(() => {})
+  const refreshCalibrations = () =>
+    api.listCalibrations().then(setCalibrations).catch(() => {})
+  const refreshBatches = useCallback((sid) => {
+    if (!sid) { setBatches([]); return }
+    api.listMeasurements(sid).then(setBatches).catch(() => {})
+  }, [])
+  const refreshPlans = useCallback((sid) => {
+    if (!sid) { setPlanRecords([]); return }
+    api.listPlans(sid).then(setPlanRecords).catch(() => {})
+  }, [])
 
   const runAnalyze = useCallback(async () => {
     setBusy('analyze'); setError(''); setPlan(null)
@@ -59,20 +79,28 @@ export default function App() {
 
   const runPlan = useCallback(async () => {
     setBusy('plan'); setError('')
+    if (planBasis === 'measurement_envelope' && !scenarioId) {
+      setError('以测量包络复核需要先保存场景（测量批次挂在场景上）')
+      setBusy('')
+      return
+    }
     try {
       const res = await api.plan({
         carriers,
         rules: { ...rules, reuse_policy: normalizePolicy(rules.reuse_policy) },
         band_low_mhz: band.low, band_high_mhz: band.high, mode: planMode,
+        scenario_id: scenarioId ?? undefined,
+        post_check_basis: planBasis,
       })
       setPlan(res)
       setPlanView(false) // 默认显示原始（冲突）谱；可切换到规划后
+      refreshPlans(scenarioId)
     } catch (e) {
       setError(e.message)
     } finally {
       setBusy('')
     }
-  }, [carriers, rules, band, planMode])
+  }, [carriers, rules, band, planMode, planBasis, scenarioId, refreshPlans])
 
   const loadScenario = async (id) => {
     if (!id) { setScenarioId(null); return }
@@ -85,6 +113,8 @@ export default function App() {
                  leakage_limit_dbm: sc.leakage_limit_dbm, reuse_policy: sc.reuse_policy || {} })
       setBand({ low: sc.band_low_mhz, high: sc.band_high_mhz })
       setAnalysis(null); setPlan(null); setSelectedPair(null)
+      setSelectedBatchId(null); setBatchDetail(null)
+      refreshBatches(sc.id); refreshPlans(sc.id)
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
 
@@ -101,6 +131,7 @@ export default function App() {
         : await api.createScenario(payload)
       setScenarioId(saved.id)
       await refreshScenarios()
+      refreshBatches(saved.id); refreshPlans(saved.id)
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
 
@@ -110,9 +141,57 @@ export default function App() {
     try {
       await api.deleteScenario(scenarioId)
       setScenarioId(null)
+      setBatches([]); setPlanRecords([])
+      setSelectedBatchId(null); setBatchDetail(null)
       await refreshScenarios()
     } catch (e) { setError(e.message) } finally { setBusy('') }
   }
+
+  const exportScenario = async () => {
+    if (!scenarioId) return
+    setError('')
+    try {
+      const doc = await api.exportScenario(scenarioId)
+      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' })
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = `${scenarioName || 'scenario'}.export.json`
+      a.click()
+      URL.revokeObjectURL(a.href)
+    } catch (e) { setError(e.message) }
+  }
+
+  const importScenarioFile = async (file) => {
+    if (!file) return
+    setBusy('import'); setError('')
+    try {
+      const doc = JSON.parse(await file.text())
+      const res = await api.importScenario(doc)
+      await refreshScenarios()
+      await loadScenario(res.id)
+    } catch (e) { setError(e.message) } finally {
+      setBusy('')
+      if (importRef.current) importRef.current.value = ''
+    }
+  }
+
+  // 测量批次选择 -> 拉取详情用于频谱叠加
+  const selectBatch = useCallback(async (bid) => {
+    setSelectedBatchId(bid)
+    setBatchDetail(null)
+    if (bid && scenarioId) {
+      try {
+        setBatchDetail(await api.getMeasurement(scenarioId, bid))
+      } catch (e) { setError(e.message) }
+    }
+  }, [scenarioId])
+
+  // 导入测量后：批次列表与计划状态都可能变化（越限 -> 计划过期）
+  const onMeasurementChanged = useCallback((newBatchId) => {
+    refreshBatches(scenarioId)
+    refreshPlans(scenarioId)
+    if (newBatchId) selectBatch(newBatchId)
+  }, [scenarioId, refreshBatches, refreshPlans, selectBatch])
 
   const status = analysis?.status
   // 频段图始终显示录入频带（按原始冲突着色），规划位置以绿色描边框叠加
@@ -125,6 +204,18 @@ export default function App() {
   const shownFindingsList = planView ? plan?.post_check?.findings : shownFindings
   const shownPower = planView ? plan?.post_check?.power_summary : analysis?.power_summary
   const shownStatus = planView ? plan?.post_check?.status : status
+
+  const measOverlay = useMemo(() => {
+    if (!batchDetail?.curves) return null
+    const c = batchDetail.curves
+    return {
+      freq_mhz: c.freq_mhz,
+      theory_dbm_hz: c.theory_dbm_hz,
+      calibrated_dbm_hz: c.calibrated_dbm_hz,
+      envelope_dbm_hz: c.envelope_dbm_hz,
+      label: `${batchDetail.batch_key}·${batchDetail.carrier_name}`,
+    }
+  }, [batchDetail])
 
   return (
     <>
@@ -159,6 +250,13 @@ export default function App() {
               </button>
               {scenarioId && <button className="danger" onClick={deleteScenario} disabled={!!busy}>删除</button>}
             </div>
+            <div className="row" style={{ marginTop: 6 }}>
+              <button onClick={exportScenario} disabled={!!busy || !scenarioId}>导出场景</button>
+              <input ref={importRef} type="file" accept=".json" style={{ display: 'none' }}
+                     onChange={(e) => importScenarioFile(e.target.files?.[0])} />
+              <button onClick={() => importRef.current?.click()} disabled={!!busy}>导入场景</button>
+              <span className="muted">含测量批次与计划记录，状态保持一致</span>
+            </div>
           </div>
 
           <div className="panel">
@@ -172,6 +270,22 @@ export default function App() {
           <div className="panel">
             <h2>规则与极化复用</h2>
             <RulesPanel rules={rules} onChange={setRules} disabled={!!busy} />
+          </div>
+
+          <div className="panel">
+            <h2>测量批次（离线扫频导入）</h2>
+            <MeasurementPanel scenarioId={scenarioId} batches={batches}
+                              selectedBatchId={selectedBatchId}
+                              onSelectBatch={selectBatch}
+                              onChanged={onMeasurementChanged}
+                              disabled={!!busy} />
+          </div>
+
+          <div className="panel">
+            <h2>校准版本</h2>
+            <CalibrationPanel calibrations={calibrations}
+                              onChanged={refreshCalibrations}
+                              disabled={!!busy} />
           </div>
 
           <div className="panel">
@@ -214,10 +328,17 @@ export default function App() {
                       </button>
                     </span>
                   )}
+                  {measOverlay && (
+                    <span className="muted">
+                      测量叠加：{measOverlay.label}
+                      {batchDetail?.violation && <span className="tag violation"> 越限</span>}
+                    </span>
+                  )}
                 </div>
-                <SpectrumChart spectrum={shownSpectrum} bands={spectrumBands} />
+                <SpectrumChart spectrum={shownSpectrum} bands={spectrumBands} overlay={measOverlay} />
                 <div className="plot-note">
-                  提示：点击上方频段条选择载波；点击下方冲突条目可高亮对应载波对。
+                  提示：点击上方频段条选择载波；点击下方冲突条目可高亮对应载波对；
+                  在左侧选择测量批次可叠加理论 / 实测 / 保守包络。
                 </div>
               </>
             )}
@@ -240,14 +361,49 @@ export default function App() {
                 <button className={planMode === 'mask_aware' ? 'on' : ''}
                         onClick={() => setPlanMode('mask_aware')}>掩模感知</button>
               </span>
+              <span className="seg">
+                <button className={planBasis === 'theory' ? 'on' : ''}
+                        onClick={() => setPlanBasis('theory')}>理论掩模复核</button>
+                <button className={planBasis === 'measurement_envelope' ? 'on allowed' : ''}
+                        onClick={() => setPlanBasis('measurement_envelope')}>测量包络复核</button>
+              </span>
               <button className="primary" onClick={runPlan} disabled={!!busy || !carriers.length}>
                 {busy === 'plan' ? '求解中…' : '求解频率位置'}
               </button>
             </div>
             <div className="hint">
               目标：在 1 kHz 网格上最小化各载波相对录入位置的总偏移；掩模感知模式按双向尾部泄漏达标反算间隔（含 0.5 dB 裕量）。
+              测量包络复核：post-check 按 max(理论掩模, 已确认实测) 的保守包络评估；关联场景的计划会持久化为计划记录。
             </div>
             {plan && <PlanResult plan={plan} />}
+            {planRecords.length > 0 && (
+              <div style={{ marginTop: 10 }}>
+                <div className="muted" style={{ marginBottom: 4 }}>计划记录（历史报告只可过期，不被篡改）</div>
+                <table className="plan-table">
+                  <thead>
+                    <tr><th>#</th><th>模式</th><th>复核基准</th><th>冲突/警告/待评估</th><th>状态</th></tr>
+                  </thead>
+                  <tbody>
+                    {planRecords.map((p) => (
+                      <tr key={p.id}>
+                        <td>{p.id}</td>
+                        <td>{p.mode === 'mask_aware' ? '掩模感知' : '仅保护间隔'}</td>
+                        <td>{p.post_check_basis === 'measurement_envelope' ? '测量包络' : '理论掩模'}</td>
+                        <td>{p.counts ? `${p.counts.error}/${p.counts.warning}/${p.counts.pending}` : '—'}</td>
+                        <td>
+                          {p.status === 'active'
+                            ? <span className="tag confirmed">有效</span>
+                            : <span className="tag superseded" title={p.expired_reason}>已过期</span>}
+                          {p.status !== 'active' && p.expired_reason && (
+                            <div className="muted" style={{ fontSize: 11 }}>{p.expired_reason}</div>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
 
           <div className="panel">
@@ -284,7 +440,8 @@ function PlanResult({ plan }) {
         <span className="spacer" />
         {counts && (
           <span className="muted">
-            规划后复核：冲突 {counts.error} · 警告 {counts.warning} · 待评估 {counts.pending}
+            规划后复核（{plan.post_check_basis === 'measurement_envelope' ? '测量包络' : '理论掩模'}）：
+            冲突 {counts.error} · 警告 {counts.warning} · 待评估 {counts.pending}
           </span>
         )}
         <button onClick={() => setOpen(!open)}>{open ? '收起' : '展开'}</button>

@@ -46,6 +46,10 @@ class PlanRequest(BaseModel):
     band_low_mhz: float = 80.0
     band_high_mhz: float = 220.0
     mode: Literal["guard_only", "mask_aware"] = "guard_only"
+    # 关联场景：提供时规划结果持久化为计划记录（可被测量/校准事件置为过期）
+    scenario_id: Optional[int] = None
+    # post-check 基准：理论掩模 / 经确认的实测保守包络
+    post_check_basis: Literal["theory", "measurement_envelope"] = "theory"
 
     def validate_band(self) -> None:
         if self.band_high_mhz <= self.band_low_mhz:
@@ -98,3 +102,88 @@ class MaskOut(BaseModel):
     points: list[list[float]]
     span_mhz: float
     description: str
+
+
+# ---- 校准版本 ---------------------------------------------------------------
+
+class CalibrationIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    # [[freq_mhz, offset_db], ...] 频率严格递增
+    factors: list[list[float]] = Field(min_length=1)
+    description: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("校准名称不能为空")
+        return v
+
+
+class CalibrationOut(BaseModel):
+    id: int
+    name: str
+    version: int
+    factors: list[list[float]]
+    description: str
+    created_at: Optional[str] = None
+
+
+# ---- 测量批次 ---------------------------------------------------------------
+
+class MeasurementImportIn(BaseModel):
+    filename: str = ""
+    content: str = Field(min_length=1)
+
+
+class MeasurementBatchOut(BaseModel):
+    id: int
+    scenario_id: int
+    batch_key: str
+    carrier_name: str
+    sampled_at: str
+    calibration_name: str
+    calibration_version: int
+    status: str            # confirmed / superseded
+    violation: bool
+    max_excess_db: float
+    points_count: int
+    imported_at: Optional[str] = None
+
+
+class MeasurementBatchDetail(MeasurementBatchOut):
+    # 列式曲线：原始记录 / 校准后 / 理论 / 偏差 / 保守包络
+    curves: dict
+
+
+class MeasurementImportResult(BaseModel):
+    # confirmed=成为当前结论；superseded=迟到旧批次被归档；duplicate=幂等重放
+    outcome: Literal["confirmed", "superseded", "duplicate"]
+    batch: MeasurementBatchOut
+    superseded_batch_ids: list[int] = []
+    expired_plan_ids: list[int] = []
+    message: str = ""
+
+
+# ---- 计划记录 ---------------------------------------------------------------
+
+class PlanRecordOut(BaseModel):
+    id: int
+    scenario_id: int
+    created_at: Optional[str] = None
+    mode: str
+    post_check_basis: str
+    feasible: bool
+    status: str            # active / expired
+    expired_reason: str = ""
+    expired_at: Optional[str] = None
+    counts: Optional[dict] = None
+
+
+class PlanRecordDetail(PlanRecordOut):
+    band_low_mhz: float
+    band_high_mhz: float
+    rules: dict
+    assignments: list
+    post_check: dict

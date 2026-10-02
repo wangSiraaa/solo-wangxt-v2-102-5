@@ -5,8 +5,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app import main
-from app.db import Base, CarrierRow, MaskRow, Scenario
+from app import main, database
+from app.db import Base, CalibrationVersion, CarrierRow, MaskRow, Scenario
 from app.seed import DEMO_CARRIERS, DEMO_POLICY
 from app.services.masks import MASKS
 
@@ -23,6 +23,9 @@ def client(monkeypatch):
         for m in MASKS.values():
             s.add(MaskRow(name=m.name, points=[list(p) for p in m.points],
                           span_mhz=m.span_mhz, description=m.description))
+        s.add(CalibrationVersion(version="cal-v1",
+                                 points=[[70.0, 0.0], [230.0, 0.0]],
+                                 description="t", is_active=True))
         sc = Scenario(name="教学演示场景", description="t", band_low_mhz=80,
                       band_high_mhz=220, guard_required_mhz=1.0,
                       leakage_limit_dbm=-45.0, reuse_policy=DEMO_POLICY,
@@ -30,6 +33,7 @@ def client(monkeypatch):
         s.add(sc)
         s.commit()
     monkeypatch.setattr(main, "engine", engine)
+    monkeypatch.setattr(database, "engine", engine)
     with TestClient(main.app) as c:
         yield c
 

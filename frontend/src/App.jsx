@@ -7,6 +7,8 @@ import PowerSummary from './components/PowerSummary.jsx'
 import BandChart from './components/BandChart.jsx'
 import SpectrumChart from './components/SpectrumChart.jsx'
 import MaskPreview from './components/MaskPreview.jsx'
+import MeasurementOverlay from './components/MeasurementOverlay.jsx'
+import MeasurementPanel from './components/MeasurementPanel.jsx'
 
 const EMPTY_RULES = { guard_required_mhz: 1.0, leakage_limit_dbm: -45.0, reuse_policy: {} }
 
@@ -31,17 +33,48 @@ export default function App() {
   const [selectedPair, setSelectedPair] = useState(null)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  // 测量批次能力
+  const [overlay, setOverlay] = useState(null)
+  const [batches, setBatches] = useState([])
+  const [calibrations, setCalibrations] = useState([])
+  const [planRuns, setPlanRuns] = useState([])
+  const [useEnvelope, setUseEnvelope] = useState(false)
 
   useEffect(() => {
     api.masks().then(setMasks).catch((e) => setError(String(e)))
+    api.calibrations().then(setCalibrations).catch(() => {})
     refreshScenarios()
   }, [])
+
+  const refreshMeasurements = useCallback((sid = scenarioId) => {
+    if (!sid) {
+      setOverlay(null); setBatches([]); setPlanRuns([])
+      return Promise.resolve()
+    }
+    return Promise.all([
+      api.measurementOverlay(sid).then(setOverlay).catch(() => setOverlay(null)),
+      api.listBatches(sid).then(setBatches).catch(() => setBatches([])),
+      api.listPlanRuns(sid).then(setPlanRuns).catch(() => setPlanRuns([])),
+    ]).then(() => api.calibrations().then(setCalibrations).catch(() => {}))
+  }, [scenarioId])
+
+  useEffect(() => { refreshMeasurements() }, [scenarioId, refreshMeasurements])
+
+  /** 测量面板操作后的统一刷新 + 消息提示（msg 为空时仅刷新）。 */
+  const afterMeasurementAction = useCallback(async (msg) => {
+    await refreshMeasurements()
+    if (msg) {
+      const rejected = String(msg).includes('拒绝') || String(msg).includes('失败')
+      setError(rejected ? msg : ''); setNotice(rejected ? '' : msg)
+    }
+  }, [refreshMeasurements])
 
   const refreshScenarios = () =>
     api.listScenarios().then(setScenarios).catch(() => {})
 
   const runAnalyze = useCallback(async () => {
-    setBusy('analyze'); setError(''); setPlan(null)
+    setBusy('analyze'); setError(''); setNotice(''); setPlan(null)
     try {
       const res = await api.analyze({
         carriers,
@@ -58,21 +91,32 @@ export default function App() {
   }, [carriers, rules])
 
   const runPlan = useCallback(async () => {
-    setBusy('plan'); setError('')
+    setBusy('plan'); setError(''); setNotice('')
     try {
-      const res = await api.plan({
+      const confirmedCount = (batches || []).filter((b) => b.status === 'confirmed').length
+      if (useEnvelope && (!scenarioId || confirmedCount === 0)) {
+        throw new Error('包络复核需要该场景至少存在一个经确认的测量批次')
+      }
+      const res = await api.planRun({
         carriers,
         rules: { ...rules, reuse_policy: normalizePolicy(rules.reuse_policy) },
         band_low_mhz: band.low, band_high_mhz: band.high, mode: planMode,
+        scenario_id: scenarioId ?? undefined,
+        use_measured_envelope: useEnvelope && !!scenarioId,
       })
       setPlan(res)
       setPlanView(false) // 默认显示原始（冲突）谱；可切换到规划后
+      if (res.post_check_basis === 'confirmed_measured_envelope') {
+        setNotice('已用经确认测量的保守包络反算间隔并完成 post-check')
+      }
+      await refreshMeasurements()
     } catch (e) {
       setError(e.message)
     } finally {
       setBusy('')
     }
-  }, [carriers, rules, band, planMode])
+  }, [carriers, rules, band, planMode, scenarioId, useEnvelope, batches,
+      refreshMeasurements])
 
   const loadScenario = async (id) => {
     if (!id) { setScenarioId(null); return }
@@ -190,6 +234,9 @@ export default function App() {
           <div className="panel">
             <div className="tabs">
               <button className={tab === 'spectrum' ? 'on' : ''} onClick={() => setTab('spectrum')}>频段与发射谱</button>
+              <button className={tab === 'measurements' ? 'on' : ''} onClick={() => setTab('measurements')}>
+                测量批次{batches.some((b) => b.has_violation && b.status === 'confirmed') ? ' ⚠' : ''}
+              </button>
               <button className={tab === 'masks' ? 'on' : ''} onClick={() => setTab('masks')}>掩模库</button>
             </div>
 
@@ -217,8 +264,16 @@ export default function App() {
                 </div>
                 <SpectrumChart spectrum={shownSpectrum} bands={spectrumBands} />
                 <div className="plot-note">
-                  提示：点击上方频段条选择载波；点击下方冲突条目可高亮对应载波对。
+                  提示：点击上方频段条选择载波；点击下方冲突条目可高亮载波对。测量叠加见「测量批次」页。
                 </div>
+              </>
+            )}
+            {tab === 'measurements' && (
+              <>
+                <MeasurementOverlay overlay={overlay} />
+                <MeasurementPanel scenarioId={scenarioId} batches={batches}
+                                  calibrations={calibrations} planRuns={planRuns}
+                                  onChanged={afterMeasurementAction} />
               </>
             )}
             {tab === 'masks' && <MaskPreview masks={masks} />}
@@ -240,13 +295,27 @@ export default function App() {
                 <button className={planMode === 'mask_aware' ? 'on' : ''}
                         onClick={() => setPlanMode('mask_aware')}>掩模感知</button>
               </span>
+              <label className="env-toggle" title="用该场景经确认测量的保守包络反算间隔并做 post-check">
+                <input type="checkbox" checked={useEnvelope}
+                       disabled={!scenarioId}
+                       onChange={(e) => setUseEnvelope(e.target.checked)} />
+                测量包络 post-check
+              </label>
               <button className="primary" onClick={runPlan} disabled={!!busy || !carriers.length}>
                 {busy === 'plan' ? '求解中…' : '求解频率位置'}
               </button>
             </div>
             <div className="hint">
               目标：在 1 kHz 网格上最小化各载波相对录入位置的总偏移；掩模感知模式按双向尾部泄漏达标反算间隔（含 0.5 dB 裕量）。
+              勾选「测量包络 post-check」后，间隔反算与复核都改用该场景经确认测量的保守包络（结果落规划历史，可追溯）。
             </div>
+            {plan?.post_check_basis === 'confirmed_measured_envelope' && (
+              <div className="env-basis">
+                本次规划基于经确认测量包络（批次 #{(plan.envelope_batch_ids || []).join(', #')}），
+                校准口径：{plan.calibration_version}
+              </div>
+            )}
+            {notice && <div className="ok-msg">{notice}</div>}
             {plan && <PlanResult plan={plan} />}
           </div>
 

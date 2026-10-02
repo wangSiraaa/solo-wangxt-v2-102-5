@@ -73,20 +73,36 @@ def edge_gap_mhz(a: Carrier, b: Carrier) -> float:
 
 
 def leakage_power_dbm(tx: Carrier, victim: Carrier,
-                      grid_step_mhz: float = 0.01) -> float:
-    """tx 载波的掩模发射谱落入 victim 频带内的总功率 (dBm)。
+                      grid_step_mhz: float = 0.01,
+                      psd_override: Optional[list[tuple[float, float]]] = None
+                      ) -> float:
+    """tx 载波的发射谱落入 victim 频带内的总功率 (dBm)。
 
     PSD 在线性域 (W/Hz) 上对频率积分：
         P_leak = ∫_victim_band 10**(psd_dbm_hz/10) * 1e-3 df
-    df 以 Hz 计。超出掩模跨度的网格点 psd = -inf，贡献为 0。
+    df 以 Hz 计。超出掩模跨度（或测量包络覆盖范围）的网格点贡献为 0。
+
+    psd_override 给定时用 (offset_mhz, dBm/Hz) 测量保守包络替代 tx 的理论掩模谱，
+    偏移相对 tx 中心频率（载波被规划移动后包络随之平移），用于
+    “以经确认的测量包络复核规划”。
     """
-    mask = get_mask(tx.mask_name)
-    f, psd = spectrum_curve(mask, tx.center_mhz, tx.bandwidth_mhz,
-                            tx.power_dbm, grid_step_mhz)
-    inside = (f >= victim.low - 1e-12) & (f <= victim.high + 1e-12)
-    if not np.any(inside):
-        return float("-inf")
-    psd_w_hz = dbm_to_watt(psd[inside])
+    if psd_override is not None:
+        f = np.arange(victim.low, victim.high + grid_step_mhz / 2, grid_step_mhz)
+        if f.size == 0:
+            return float("-inf")
+        of = np.array([p[0] for p in psd_override], dtype=float) + tx.center_mhz
+        op = np.array([p[1] for p in psd_override], dtype=float)
+        psd = np.interp(f, of, op, left=-np.inf, right=-np.inf)
+    else:
+        mask = get_mask(tx.mask_name)
+        f, psd = spectrum_curve(mask, tx.center_mhz, tx.bandwidth_mhz,
+                                tx.power_dbm, grid_step_mhz)
+        inside = (f >= victim.low - 1e-12) & (f <= victim.high + 1e-12)
+        if not np.any(inside):
+            return float("-inf")
+        psd = psd[inside]
+        f = f[inside]
+    psd_w_hz = dbm_to_watt(psd)
     df_hz = grid_step_mhz * 1e6
     p_w = float(np.trapezoid(psd_w_hz, dx=df_hz))
     return watt_to_dbm(p_w)
@@ -105,9 +121,16 @@ def _finding(ftype: str, severity: str, a: Carrier, b: Carrier,
     return out
 
 
-def analyze(carriers: list[Carrier], rules: AnalysisRules) -> dict:
-    """对整组载波做冲突检查与功率汇总。"""
+def analyze(carriers: list[Carrier], rules: AnalysisRules,
+            psd_overrides: Optional[dict[str, list[tuple[float, float]]]] = None
+            ) -> dict:
+    """对整组载波做冲突检查与功率汇总。
+
+    psd_overrides: {载波名: [(f_mhz, dBm/Hz), ...]}，给定时该载波作为发射机
+    的尾部泄漏按“经确认测量的保守包络”而非理论掩模评估（post-check 口径）。
+    """
     findings: list[dict] = []
+    psd_overrides = psd_overrides or {}
 
     for a, b in itertools.combinations(carriers, 2):
         # 边缘净距：频带不相交时 >0（净空），相切时 0，重叠时 <0
@@ -160,7 +183,8 @@ def analyze(carriers: list[Carrier], rules: AnalysisRules) -> dict:
         skip_tail = (policy == "allowed") or geometrically_overlap
         if not skip_tail:
             for tx, victim in ((a, b), (b, a)):
-                leak = leakage_power_dbm(tx, victim)
+                leak = leakage_power_dbm(
+                    tx, victim, psd_override=psd_overrides.get(tx.name))
                 if leak > rules.leakage_limit_dbm:
                     findings.append(_finding(
                         "mask_tail", "error", tx, victim,

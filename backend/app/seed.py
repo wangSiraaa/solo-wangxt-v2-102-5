@@ -1,12 +1,20 @@
-"""建表并写入示例掩模与教学演示场景（幂等：重复执行不产生重复数据）。"""
+"""建表并写入示例掩模、教学演示场景与初始校准版本（幂等：重复执行不产生重复数据）。"""
 from __future__ import annotations
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from .config import DATABASE_URL
-from .db import Base, CarrierRow, MaskRow, Scenario
+from .db import (Base, CalibrationVersion, CarrierRow, MaskRow, Scenario)
 from .services.masks import MASKS
+
+# 初始频谱仪校准：70–230 MHz 全通（0 dB 增益），覆盖演示场景频带。
+# 修订时新增版本行（POST /api/calibrations），旧版本冻结。
+DEFAULT_CALIBRATION = {
+    "version": "cal-v1",
+    "points": [[70.0, 0.0], [230.0, 0.0]],
+    "description": "出厂默认校准：全频段 0 dB 增益（教学示例）",
+}
 
 DEMO_POLICY = {
     "H|V": "unknown",     # 水平/垂直：隔离度未知 -> 同频复用待评估
@@ -58,6 +66,18 @@ def seed(engine) -> None:
             if row is None:
                 s.add(MaskRow(name=m.name, points=[list(p) for p in m.points],
                               span_mhz=m.span_mhz, description=m.description))
+
+        cal = s.scalar(select(CalibrationVersion)
+                       .where(CalibrationVersion.version == DEFAULT_CALIBRATION["version"]))
+        active = s.scalar(select(CalibrationVersion)
+                          .where(CalibrationVersion.is_active.is_(True)))
+        if cal is None:
+            s.add(CalibrationVersion(version=DEFAULT_CALIBRATION["version"],
+                                     points=DEFAULT_CALIBRATION["points"],
+                                     description=DEFAULT_CALIBRATION["description"],
+                                     is_active=active is None))
+        elif active is None:
+            cal.is_active = True
 
         existing = s.scalar(select(Scenario).where(Scenario.name == "教学演示场景"))
         if existing is None:

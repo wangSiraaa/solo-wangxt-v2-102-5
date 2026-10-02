@@ -40,15 +40,30 @@ class BandLimits:
 
 
 def _leakage_at_separation(tx: Carrier, victim_bw_mhz: float,
-                           separation_mhz: float, grid_step_mhz: float = 0.01) -> float:
+                           separation_mhz: float, grid_step_mhz: float = 0.01,
+                           psd_override: list[tuple[float, float]] | None = None
+                           ) -> float:
     """tx 中心与一个位于其右侧、带宽 victim_bw 的虚拟受害载波中心相距 separation 时，
-    落入受害频带的泄漏功率 dBm。"""
+    落入受害频带的泄漏功率 dBm。
+
+    psd_override 给定时用经确认测量的保守包络 (offset_mhz, dBm/Hz) 替代理论掩模谱，
+    偏移相对 tx 中心频率（随载波规划移动而平移）。
+    """
+    v_low = tx.center_mhz + separation_mhz - victim_bw_mhz / 2.0
+    v_high = tx.center_mhz + separation_mhz + victim_bw_mhz / 2.0
+    if psd_override is not None:
+        f = np.arange(v_low, v_high + grid_step_mhz / 2, grid_step_mhz)
+        if f.size == 0:
+            return float("-inf")
+        of = np.asarray([p[0] for p in psd_override], dtype=float) + tx.center_mhz
+        op = np.asarray([p[1] for p in psd_override], dtype=float)
+        psd = np.interp(f, of, op, left=-np.inf, right=-np.inf)
+        p_w = float(np.trapezoid(dbm_to_watt(psd), dx=grid_step_mhz * 1e6))
+        return watt_to_dbm(p_w)
     mask = get_mask(tx.mask_name)
     from .masks import spectrum_curve
     f, psd = spectrum_curve(mask, tx.center_mhz, tx.bandwidth_mhz,
                             tx.power_dbm, grid_step_mhz)
-    v_low = tx.center_mhz + separation_mhz - victim_bw_mhz / 2.0
-    v_high = tx.center_mhz + separation_mhz + victim_bw_mhz / 2.0
     inside = (f >= v_low - 1e-12) & (f <= v_high + 1e-12)
     if not np.any(inside):
         return float("-inf")
@@ -57,42 +72,63 @@ def _leakage_at_separation(tx: Carrier, victim_bw_mhz: float,
 
 
 def _required_gap_one_direction(tx: Carrier, victim: Carrier,
-                                rules: AnalysisRules, grid_step_mhz: float = EVAL_GRID_MHZ) -> float:
+                                rules: AnalysisRules, grid_step_mhz: float = EVAL_GRID_MHZ,
+                                psd_override: list[tuple[float, float]] | None = None
+                                ) -> float:
     """扫描最小边缘净距 g（网格对齐），使 tx 落入 victim 频带的泄漏 <= 限值。
 
     规划口径将限值收紧 PLAN_MARGIN_DB，保证规划结果在分析口径下留有裕量。
     净距 g 时中心间距 = g + (BW_tx + BW_victim)/2。
-    g 达到 mask 跨度 - victim 半宽后两频带不再相交，泄漏为 -inf，必然达标。
+    使用测量包络时按包络覆盖范围扫描；g 继续增大后两频带在测量覆盖之外，
+    泄漏视为 0（该简化模型中测量覆盖不到的地方不产生泄漏）。
     """
     limit = rules.leakage_limit_dbm - PLAN_MARGIN_DB
-    max_gap = get_mask(tx.mask_name).span_mhz - victim.bandwidth_mhz / 2.0
+    if psd_override is not None:
+        # 偏移相对 tx 中心：包络末端偏移 - 受害半宽，即泄漏为零的边缘净距
+        max_offset = max(p[0] for p in psd_override)
+        max_gap = max(0.0, max_offset - victim.bandwidth_mhz / 2.0)
+    else:
+        max_gap = get_mask(tx.mask_name).span_mhz - victim.bandwidth_mhz / 2.0
     n_steps = int(max_gap / grid_step_mhz) + 1
     for k in range(n_steps + 1):
         g = k * grid_step_mhz
         sep = g + (tx.bandwidth_mhz + victim.bandwidth_mhz) / 2.0
-        if _leakage_at_separation(tx, victim.bandwidth_mhz, sep, grid_step_mhz) <= limit:
+        if _leakage_at_separation(tx, victim.bandwidth_mhz, sep, grid_step_mhz,
+                                  psd_override=psd_override) <= limit:
             return g
     return max_gap
 
 
-def _safe_edge_gap(a: Carrier, b: Carrier, rules: AnalysisRules) -> float:
+def _safe_edge_gap(a: Carrier, b: Carrier, rules: AnalysisRules,
+                   psd_overrides: dict[str, list[tuple[float, float]]] | None = None
+                   ) -> float:
     """掩模感知所需的最小边缘净距 (MHz)。
 
     泄漏与“谁在左”无关：无论排序如何，a->b 与 b->a 两个方向的泄漏都必须达标，
     因此取两个方向所需净距的最大值，同时不小于保护间隔规则。
+    psd_overrides 给定时用 {载波名: 测量保守包络} 替代对应方向的理论谱。
     结果向上对齐到 10 kHz（EVAL_GRID_MHZ 的整数倍，1 kHz 规划网格可精确实现）。
     """
-    g = max(_required_gap_one_direction(a, b, rules),
-            _required_gap_one_direction(b, a, rules),
+    psd_overrides = psd_overrides or {}
+    g = max(_required_gap_one_direction(a, b, rules,
+                                        psd_override=psd_overrides.get(a.name)),
+            _required_gap_one_direction(b, a, rules,
+                                        psd_override=psd_overrides.get(b.name)),
             rules.guard_required_mhz)
     return float(np.ceil(g / EVAL_GRID_MHZ + 1e-9) * EVAL_GRID_MHZ)
 
 
 def plan(carriers: list[Carrier], rules: AnalysisRules,
-         band: BandLimits, mode: str = "guard_only") -> dict:
-    """用 CP-SAT 求一组可行频率位置。"""
+         band: BandLimits, mode: str = "guard_only",
+         psd_overrides: dict[str, list[tuple[float, float]]] | None = None) -> dict:
+    """用 CP-SAT 求一组可行频率位置。
+
+    mode="measured_envelope" 等价于 mask_aware 的约束结构，但每对载波所需
+    间隔按经确认测量的保守包络反算；post-check 也必须用同一包络复核。
+    """
     from ortools.sat.python import cp_model
 
+    psd_overrides = psd_overrides or {}
     model = cp_model.CpModel()
     n = len(carriers)
 
@@ -124,9 +160,9 @@ def plan(carriers: list[Carrier], rules: AnalysisRules,
                                   "required_edge_mhz": 0.0})
                 continue
 
-            if mode == "mask_aware":
-                # 双向泄漏都达标所需净距（与排序无关）
-                req_edge = khz(_safe_edge_gap(a, b, rules))
+            if mode in ("mask_aware", "measured_envelope"):
+                # 双向泄漏都达标所需净距（与排序无关）；测量包络模式用实测包络反算
+                req_edge = khz(_safe_edge_gap(a, b, rules, psd_overrides))
                 req_i_left = req_j_left = req_edge
             else:
                 g = khz(rules.guard_required_mhz)

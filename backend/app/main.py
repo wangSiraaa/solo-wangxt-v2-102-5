@@ -6,17 +6,19 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .database import engine
 from .assemble import bands_view, build_spectrum, to_domain, to_rules, validate_masks
-from .config import CORS_ORIGINS, DATABASE_URL
+from .config import CORS_ORIGINS
 from .db import Base, CarrierRow, MaskRow, Scenario
 from .schemas import (AnalyzeRequest, MaskOut, PlanRequest, ScenarioIn,
                       ScenarioOut, ScenarioSummary)
 from .seed import seed
 from .services.analysis import Carrier, analyze
 from .services.planner import BandLimits, plan
+from .measurements_api import router as measurements_router
 
 app = FastAPI(
     title="频谱工作台 API（离线教学模型）",
@@ -31,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+app.include_router(measurements_router)
 
 
 @app.on_event("startup")

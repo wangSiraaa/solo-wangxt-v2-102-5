@@ -33,4 +33,30 @@ export const api = {
     request('/analyze', { method: 'POST', body: JSON.stringify(payload) }),
   plan: (payload) =>
     request('/plan', { method: 'POST', body: JSON.stringify(payload) }),
+
+  // ---- 测量批次 / 校准 / 规划记录 ----
+  calibrations: () => request('/calibrations'),
+  createCalibration: (payload) =>
+    request('/calibrations', { method: 'POST', body: JSON.stringify(payload) }),
+  measurementOverlay: (scenarioId) =>
+    request(`/scenarios/${scenarioId}/measurements/overlay`),
+  listBatches: (scenarioId) =>
+    request(`/scenarios/${scenarioId}/measurements/batches`),
+  getBatch: (id) => request(`/measurements/batches/${id}`),
+  importSweepText: (scenarioId, text, format = 'csv') =>
+    request(`/scenarios/${scenarioId}/measurements/import-text`, {
+      method: 'POST', body: JSON.stringify({ text, format }),
+    }),
+  confirmBatch: (id) =>
+    request(`/measurements/batches/${id}/confirm`, { method: 'POST' }),
+  planRun: (payload) =>
+    request('/plan-runs', { method: 'POST', body: JSON.stringify(payload) }),
+  listPlanRuns: (scenarioId) =>
+    request(`/scenarios/${scenarioId}/plan-runs`),
+  exportBundle: (scenarioId) =>
+    request(`/scenarios/${scenarioId}/measurements/export`),
+  importBundle: (scenarioId, bundle) =>
+    request(`/scenarios/${scenarioId}/measurements/import-bundle`, {
+      method: 'POST', body: JSON.stringify({ bundle }),
+    }),
 }
